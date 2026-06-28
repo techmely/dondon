@@ -1,0 +1,251 @@
+name: Release Desktop
+
+# Build DonDon desktop installers from techmely/dondon source and publish to
+# techmely/dondon GitHub Releases (cross-repo). Owned by dondon-build repo.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Semver version (e.g. 0.2.0)"
+        required: true
+        type: string
+      dondon_ref:
+        description: "dondon source ref (default v{version})"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DONDON_OWNER: techmely
+  DONDON_REPO: dondon
+  RUST_TOOLCHAIN: "1.77.2"
+  NODE_VERSION: "20"
+
+jobs:
+  prepare:
+    name: Prepare release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      dondon_ref: ${{ steps.meta.outputs.dondon_ref }}
+      release_body: ${{ steps.notes.outputs.body }}
+      has_release_token: ${{ steps.meta.outputs.has_release_token }}
+      has_signing_key: ${{ steps.meta.outputs.has_signing_key }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: meta
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+            REF="${{ inputs.dondon_ref }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+            REF=""
+          fi
+          TAG="v${VERSION}"
+          if [ -z "$REF" ]; then REF="$TAG"; fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "dondon_ref=$REF" >> "$GITHUB_OUTPUT"
+          if [ -n "${{ secrets.DONDON_RELEASE_TOKEN }}" ]; then
+            echo "has_release_token=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_release_token=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -n "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}" ]; then
+            echo "has_signing_key=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_signing_key=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout dondon source for changelog
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.DONDON_OWNER }}/${{ env.DONDON_REPO }}
+          ref: ${{ steps.meta.outputs.dondon_ref }}
+          path: dondon
+          token: ${{ secrets.DONDON_RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - id: notes
+        run: |
+          BODY=$(node scripts/extract-changelog.mjs "${{ steps.meta.outputs.version }}" dondon/CHANGELOG.md)
+          {
+            echo "body<<EOF"
+            echo "$BODY"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  release:
+    name: Build (${{ matrix.platform_label }})
+    needs: prepare
+    if: needs.prepare.outputs.has_release_token == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            platform_label: macOS (Apple Silicon)
+            args: --target aarch64-apple-darwin
+          - platform: macos-latest
+            platform_label: macOS (Intel)
+            args: --target x86_64-apple-darwin
+          - platform: windows-latest
+            platform_label: Windows
+            args: ""
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout dondon monorepo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.DONDON_OWNER }}/${{ env.DONDON_REPO }}
+          ref: ${{ needs.prepare.outputs.dondon_ref }}
+          path: dondon
+          token: ${{ secrets.DONDON_RELEASE_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            dondon/frontend/package-lock.json
+            dondon/desktop/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: dondon/desktop/src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: dondon/frontend
+
+      - name: Install desktop dependencies
+        run: npm ci
+        working-directory: dondon/desktop
+
+      - id: build_args
+        run: |
+          ARGS="${{ matrix.args }}"
+          if [ "${{ needs.prepare.outputs.has_signing_key }}" != "true" ]; then
+            ARGS="$ARGS --config '{\"bundle\":{\"createUpdaterArtifacts\":false}}'"
+          fi
+          echo "args=$ARGS" >> "$GITHUB_OUTPUT"
+
+      - name: Build and publish to GitHub Releases
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.DONDON_RELEASE_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          owner: ${{ env.DONDON_OWNER }}
+          repo: ${{ env.DONDON_REPO }}
+          projectPath: dondon/desktop
+          tauriScript: npm run tauri
+          tagName: ${{ needs.prepare.outputs.tag }}
+          releaseName: DonDon v${{ needs.prepare.outputs.version }}
+          releaseBody: ${{ needs.prepare.outputs.release_body }}
+          releaseDraft: false
+          prerelease: false
+          uploadUpdaterJson: true
+          updaterJsonPreferNsis: true
+          args: ${{ steps.build_args.outputs.args }}
+
+  publish-manifest-fallback:
+    name: Publish latest.json (unsigned fallback)
+    needs: [prepare, release]
+    if: |
+      needs.prepare.outputs.has_release_token == 'true' &&
+      needs.prepare.outputs.has_signing_key == 'false' &&
+      needs.release.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Checkout dondon for changelog
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.DONDON_OWNER }}/${{ env.DONDON_REPO }}
+          ref: ${{ needs.prepare.outputs.dondon_ref }}
+          path: dondon
+          token: ${{ secrets.DONDON_RELEASE_TOKEN }}
+
+      - name: Fetch release assets
+        env:
+          GH_TOKEN: ${{ secrets.DONDON_RELEASE_TOKEN }}
+        run: |
+          gh release view "${{ needs.prepare.outputs.tag }}" \
+            --repo "${{ env.DONDON_OWNER }}/${{ env.DONDON_REPO }}" \
+            --json assets > release.json
+          jq '[.assets[] | {name, browser_download_url}]' release.json > assets.json
+          gh release download "${{ needs.prepare.outputs.tag }}" \
+            --repo "${{ env.DONDON_OWNER }}/${{ env.DONDON_REPO }}" \
+            --pattern "*.sig" \
+            --dir sigs || true
+          node -e "
+            const fs = require('fs');
+            const assets = JSON.parse(fs.readFileSync('assets.json','utf8'));
+            for (const a of assets) {
+              const sigPath = 'sigs/' + a.name + '.sig';
+              if (fs.existsSync(sigPath)) {
+                a.signatureContent = fs.readFileSync(sigPath,'utf8').trim();
+              }
+            }
+            fs.writeFileSync('assets.json', JSON.stringify(assets));
+          "
+
+      - name: Generate latest.json
+        run: |
+          node scripts/extract-changelog.mjs \
+            "${{ needs.prepare.outputs.version }}" \
+            dondon/CHANGELOG.md > release-notes.md
+          node scripts/generate-latest-json.mjs \
+            --version "${{ needs.prepare.outputs.version }}" \
+            --notes-file release-notes.md \
+            --assets-json assets.json \
+            --output latest.json
+          cat latest.json
+
+      - name: Upload latest.json to release
+        env:
+          GH_TOKEN: ${{ secrets.DONDON_RELEASE_TOKEN }}
+        run: |
+          gh release upload "${{ needs.prepare.outputs.tag }}" \
+            --repo "${{ env.DONDON_OWNER }}/${{ env.DONDON_REPO }}" \
+            --clobber \
+            latest.json
+
+  secrets-gate:
+    name: Verify release secrets
+    needs: prepare
+    if: needs.prepare.outputs.has_release_token != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Missing DONDON_RELEASE_TOKEN
+        run: |
+          echo "::error::Secret DONDON_RELEASE_TOKEN is required to publish cross-repo to ${{ env.DONDON_OWNER }}/${{ env.DONDON_REPO }}."
+          echo "Create a fine-grained PAT with Contents: Read and write on techmely/dondon and add it as repo secret DONDON_RELEASE_TOKEN in dondon-build."
+          exit 1
